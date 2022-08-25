@@ -320,6 +320,72 @@ class AotPrimsNvfuser(AotAutogradStrategy):
 
 aot_prims_nvfuser = AotPrimsNvfuser.compile_fn
 
+class AotOrt(AotAutogradStrategy):
+    """
+    Use FX graph partitioner + Aten2Aten decomposition + trace executor + ORT
+    """
+
+    def __init__(self, gm: torch.fx.GraphModule, example_inputs):
+        super().__init__(gm, example_inputs)
+
+        from functorch.compile import min_cut_rematerialization_partition
+        from torch.fx.passes.backends.onnxruntime import OrtBackend
+
+        self.ort = OrtBackend()
+        self.min_cut_rematerialization_partition = min_cut_rematerialization_partition
+        self.populate_aten2aten_decomps()
+
+    def populate_aten2aten_decomps(self):
+        from torch._decomp import get_decompositions
+
+        aten = torch.ops.aten
+        default_decompositions = {
+            aten.detach,
+            aten.gelu_backward,
+            aten.leaky_relu_backward,
+            aten.sigmoid_backward,
+            aten.threshold_backward,
+            aten.hardtanh_backward,
+            aten.hardsigmoid_backward,
+            aten.hardswish_backward,
+            aten.tanh_backward,
+            aten.silu_backward,
+            aten.elu_backward,
+            aten.cudnn_batch_norm,
+            aten.cudnn_batch_norm_backward,
+            aten.masked_fill.Scalar,
+            aten.masked_fill.Tensor,
+            aten.elu,
+            aten.leaky_relu,
+            aten.hardtanh,
+            aten.hardswish,
+            aten.hardsigmoid,
+            aten.rsub,
+            aten.native_batch_norm_backward,
+        }
+
+        self.aten2aten_decompositions = get_decompositions(default_decompositions)
+
+    def candidate(self):
+        return BACKENDS["aot_autograd"](
+            self.gm,
+            self.example_inputs,
+            fw_compiler=self.ort,
+            hasher_type="StaticShapeHasher",
+            decompositions=self.aten2aten_decompositions,
+        )
+
+
+class AOTAutogradOrtWithContext:
+    """Pass nvfuser context to TorchDynamo"""
+
+    def __init__(self):
+        self.backend_ctx_ctor = lambda: torch.jit.fuser("none")
+
+    def __call__(self, gm: torch.fx.GraphModule, example_inputs):
+        return AotOrt.compile_fn(gm, example_inputs)
+
+aot_ort = AOTAutogradOrtWithContext()
 
 def prims_executor(gm, inputs, *, executor):
     # This function is called once per forward/backward pass of a graph in AOT
@@ -537,6 +603,7 @@ def create_aot_backends():
     # This is useful for debugging. Can be removed later.
     BACKENDS["nvprims_aten"] = aot_nvprims_aten
 
+    BACKENDS["aot_ort"] = aot_ort
     # aot_nvfuser uses the memory efficient fusion algorithm from AOT Autograd.
     # It uses min cut rematerialization algorithm, and uses nvfuser as the
     # compiler backend. This is the most optimized setting with nvfuser for
